@@ -1,15 +1,18 @@
 use anyhow::Result;
 use base64::prelude::*;
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode};
+use crossterm::{
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
 use dirs::home_dir;
-use itertools::Itertools;
-use mpris::{Metadata, PlayerFinder};
+use mpris::PlayerFinder;
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     widgets::{Block, Borders, Paragraph, Widget},
 };
@@ -23,8 +26,43 @@ use std::{
 };
 use strum::{EnumIter, IntoEnumIterator};
 
-mod error;
-use error::LyricError;
+use thiserror::Error;
+
+#[derive(Error, Debug)]
+pub enum LyricError {
+    #[error("MPRIS error: {0}")]
+    MprisError(#[from] mpris::DBusError),
+
+    #[error("HTTP error: {0}")]
+    ReqwestError(#[from] reqwest::Error),
+
+    #[error("I/O error: {0}")]
+    IoError(#[from] std::io::Error),
+
+    #[error("No active media player found")]
+    NoPlayerFound,
+
+    #[error("Failed to get cache path")]
+    CachePathError,
+
+    #[error("No lyrics found")]
+    NoLyricFound,
+
+    #[error("JSON parse error")]
+    JsonError,
+
+    #[error("Lyric validation failed")]
+    LyricValidationFailed,
+
+    #[error("Lyric decode failed")]
+    LyricDecodeError,
+
+    #[error("Invalid time format: {0}")]
+    InvalidTimeFormat(String),
+
+    #[error("Empty lyric content")]
+    EmptyLyric,
+}
 
 const CACHE_DIR: &str = ".local/share/lyrics";
 
@@ -370,6 +408,7 @@ struct AppState {
     lyrics: Vec<LyricLine>,
     last_update: Instant,
     scroll_offset: usize,
+    current_time: f64,
 }
 
 impl AppState {
@@ -379,6 +418,7 @@ impl AppState {
             lyrics: Vec::new(),
             last_update: Instant::now(),
             scroll_offset: 0,
+            current_time: 0.0,
         }
     }
 
@@ -386,14 +426,17 @@ impl AppState {
         let new_song = get_current_song()?;
 
         // 歌曲发生变化时重新加载歌词
-        if Some(new_song) != self.current_song {
-            self.handle_song_change(new_song.clone());
+        if Some(new_song.clone()) != self.current_song {
+            self.handle_song_change(new_song);
         }
 
         // 更新时间进度
         let delta = self.last_update.elapsed().as_secs_f64();
         self.last_update = Instant::now();
         self.update_progress(delta);
+
+        self.current_time += delta;
+        self.current_time %= self.total_duration().unwrap_or(0.0);
 
         if let Some(pos) = self.find_current_line() {
             self.scroll_offset = pos.saturating_sub(5); // 保持当前行在中间
@@ -403,7 +446,7 @@ impl AppState {
     }
 
     async fn handle_song_change(&mut self, song: SongInfo) -> Result<()> {
-        self.current_song = Some(song.clone());
+        self.current_song = Some(song);
         self.lyrics.clear();
         self.scroll_offset = 0;
 
@@ -417,7 +460,7 @@ impl AppState {
 
     fn find_current_line(&self) -> Option<usize> {
         self.lyrics
-            .binary_search_by(|line| line.timestamp.partial_cmp(&self.last_update).unwrap())
+            .binary_search_by(|line| line.timestamp.partial_cmp(&self.current_time).unwrap())
             .ok()
     }
 
@@ -497,7 +540,7 @@ impl<'a> Widget for LyricWidget<'a> {
 
 // 保持UI和主循环不变
 async fn run() -> Result<()> {
-    let mut terminal = Terminal::new(CrosstermBackend::new(std::io::stdout()))?;
+    let mut terminal = setup_terminal()?;
     let mut app_state = AppState::new();
 
     loop {
@@ -506,12 +549,25 @@ async fn run() -> Result<()> {
 
         // 渲染界面
         terminal.draw(|f| {
-            let chunks = Layout::default()
+            //     let chunks = Layout::default()
+            //         .margin(1)
+            //         .constraints([Constraint::Percentage(100)])
+            //         .split(f.size());
+
+            //     f.render_widget(LyricWidget(&app_state), chunks);
+
+            // 创建垂直布局
+            let main_layout = Layout::default()
+                .direction(Direction::Vertical)
                 .margin(1)
                 .constraints([Constraint::Percentage(100)])
                 .split(f.size());
 
-            f.render_widget(LyricWidget(&app_state), chunks);
+            // 获取主内容区域
+            let content_area = main_layout.first().unwrap();
+
+            // 渲染到第一个子区域
+            f.render_widget(LyricWidget(&app_state), *content_area);
         })?;
 
         // 控制刷新率（每秒20帧）
@@ -527,7 +583,22 @@ async fn run() -> Result<()> {
         }
     }
 
+    restore_terminal(terminal)?;
+
     Ok(())
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<std::io::Stdout>>> {
+    enable_raw_mode()?;
+    let mut stdout = std::io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout))?)
+}
+
+fn restore_terminal(mut terminal: Terminal<CrosstermBackend<std::io::Stdout>>) -> Result<()> {
+    disable_raw_mode()?;
+    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
+    Ok(terminal.show_cursor()?)
 }
 
 #[tokio::main]
