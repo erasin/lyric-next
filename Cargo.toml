@@ -1,0 +1,21 @@
+[package]
+name = "lyric-next"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0"
+base64 = "0.22.1"
+clap = { version = "4.0", features = ["derive"] }
+crossterm = "0.27"
+dirs = "5.0"
+itertools = "0.14.0"
+mpris = "2.0.1"
+ratatui = "0.23"
+reqwest = { version = "0.11", features = ["json"] }
+ropey = "1.6.1"
+sanitize-filename = "0.4"
+serde_json = "1.0"
+strum = { version = "0.27.1", features = ["derive"] }
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["full"] }
