@@ -7,7 +7,7 @@ use crossterm::{
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use dirs::home_dir;
-use mpris::PlayerFinder;
+use mpris::{Player, PlayerFinder};
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
@@ -73,9 +73,9 @@ struct Args;
 #[derive(Clone, Copy, Debug, EnumIter, strum::Display)]
 enum MusicSource {
     Netease,
-    Kugou,
-    QQ,
-    Spotify,
+    // Kugou,
+    // QQ,
+    // Spotify,
 }
 
 fn normalize_text(s: &str) -> String {
@@ -105,24 +105,40 @@ async fn fetch_lyric(song: &SongInfo) -> Result<Rope, LyricError> {
 }
 
 async fn check_cached_lyrics(song: &SongInfo) -> Result<Rope, LyricError> {
-    let path = MusicSource::iter()
-        .filter_map(|source| get_cache_path(song, source).ok())
-        .last();
+    let mut candidates: Vec<_> = MusicSource::iter()
+        .filter_map(|source| {
+            let path = get_cache_path(song, source).ok()?;
+            if path.exists() {
+                let modified = fs::metadata(&path).ok()?.modified().ok()?;
+                Some((path, modified))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    Ok(Rope::from_reader(fs::File::open(path.unwrap())?)?)
+    // 按修改时间排序，选择最新的缓存
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    let path = candidates
+        .first()
+        .map(|(p, _)| p)
+        .ok_or(LyricError::NoLyricFound)?;
+
+    let content = tokio::fs::read_to_string(&path).await?;
+    Ok(Rope::from_str(&content))
 }
 
 async fn try_fetch_from_source(song: &SongInfo, source: MusicSource) -> Result<Rope, LyricError> {
     let lyric = match source {
         MusicSource::Netease => fetch_netease(song).await,
-        MusicSource::QQ => fetch_qqmusic(song).await,
-        MusicSource::Kugou => fetch_kugou(song).await,
-        MusicSource::Spotify => fetch_spotify(song).await,
+        // MusicSource::QQ => fetch_qqmusic(song).await,
+        // MusicSource::Kugou => fetch_kugou(song).await,
+        // MusicSource::Spotify => fetch_spotify(song).await,
     }?;
 
     if verify_lyric(song, &lyric) {
         let path = get_cache_path(song, source)?;
-        fs::write(path, &lyric)?;
+        tokio::fs::write(path, &lyric).await?;
         Ok(Rope::from(lyric))
     } else {
         Err(LyricError::LyricValidationFailed)
@@ -131,8 +147,13 @@ async fn try_fetch_from_source(song: &SongInfo, source: MusicSource) -> Result<R
 
 fn verify_lyric(song: &SongInfo, lyric: &str) -> bool {
     let normalized_lyric = normalize_text(lyric);
-    normalized_lyric.contains(&normalize_text(&song.title))
-        && normalized_lyric.contains(&normalize_text(&song.artist))
+    let has_title = normalized_lyric.contains(&normalize_text(&song.title));
+    let has_artist = normalized_lyric.contains(&normalize_text(&song.artist));
+
+    // 额外检查时长标签（如果有）
+    let has_duration = lyric.contains(&format!("{:0.1}", song.duration));
+
+    has_title && has_artist && (song.duration <= 0.0 || has_duration)
 }
 
 // 网易云实现
@@ -271,21 +292,21 @@ fn get_cache_path(song: &SongInfo, source: MusicSource) -> Result<PathBuf, Lyric
             sanitize(&song.artist),
             sanitize(&song.title)
         ),
-        MusicSource::QQ => format!(
-            "qqmusic_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-        MusicSource::Kugou => format!(
-            "kugou_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-        MusicSource::Spotify => format!(
-            "spotify_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
+        // MusicSource::QQ => format!(
+        //     "qqmusic_{}_{}.lrc",
+        //     sanitize(&song.artist),
+        //     sanitize(&song.title)
+        // ),
+        // MusicSource::Kugou => format!(
+        //     "kugou_{}_{}.lrc",
+        //     sanitize(&song.artist),
+        //     sanitize(&song.title)
+        // ),
+        // MusicSource::Spotify => format!(
+        //     "spotify_{}_{}.lrc",
+        //     sanitize(&song.artist),
+        //     sanitize(&song.title)
+        // ),
     };
 
     path.push(filename);
@@ -309,7 +330,7 @@ impl SongInfo {
     }
 }
 
-fn get_current_song() -> Result<SongInfo, LyricError> {
+fn get_current_song() -> Result<(Player, SongInfo), LyricError> {
     let player = PlayerFinder::new()?
         .find_active()
         .map_err(|_| LyricError::NoPlayerFound)?;
@@ -318,13 +339,16 @@ fn get_current_song() -> Result<SongInfo, LyricError> {
 
     let title = metadata.title().unwrap_or_default().to_string();
     let artist = metadata.artists().map(|a| a.join(", ")).unwrap_or_default();
-    let duration = metadata.disc_number().unwrap_or_default().into();
+    let duration = metadata.length().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
-    Ok(SongInfo {
-        title,
-        artist,
-        duration,
-    })
+    Ok((
+        player,
+        SongInfo {
+            title,
+            artist,
+            duration,
+        },
+    ))
 }
 
 // 解析主逻辑
@@ -367,12 +391,20 @@ impl LyricParser {
 
         // 添加有效歌词行
         let text = line.trim();
-        if !text.is_empty() && !time_tags.is_empty() {
-            for timestamp in time_tags {
+
+        if !text.is_empty() {
+            if time_tags.is_empty() {
                 output.push(LyricLine {
-                    timestamp,
+                    timestamp: 0.0,
                     text: text.to_string(),
                 });
+            } else {
+                for timestamp in time_tags {
+                    output.push(LyricLine {
+                        timestamp,
+                        text: text.to_string(),
+                    });
+                }
             }
         }
 
@@ -404,42 +436,67 @@ struct LyricLine {
 
 // 界面状态管理
 struct AppState {
+    player: Option<Player>,
     current_song: Option<SongInfo>,
     lyrics: Vec<LyricLine>,
-    last_update: Instant,
     scroll_offset: usize,
     current_time: f64,
+    last_valid_pos: Option<(Instant, f64)>,
 }
 
 impl AppState {
     fn new() -> Self {
         Self {
+            player: None,
             current_song: None,
             lyrics: Vec::new(),
-            last_update: Instant::now(),
             scroll_offset: 0,
             current_time: 0.0,
+            last_valid_pos: None,
         }
     }
 
     async fn update(&mut self) -> Result<()> {
-        let new_song = get_current_song()?;
+        // 获取当前播放器和歌曲信息
+        let result = get_current_song();
+        let (new_player, new_song) = match result {
+            Ok((p, s)) => (Some(p), s),
+            Err(LyricError::NoPlayerFound) => {
+                self.player = None;
+                self.current_song = None;
+                self.lyrics.clear();
+                return Ok(());
+            }
+            Err(e) => return Err(e.into()),
+        };
 
         // 歌曲发生变化时重新加载歌词
         if Some(new_song.clone()) != self.current_song {
-            self.handle_song_change(new_song);
+            self.handle_song_change(new_song).await?;
+            self.player = new_player;
         }
 
-        // 更新时间进度
-        let delta = self.last_update.elapsed().as_secs_f64();
-        self.last_update = Instant::now();
-        self.update_progress(delta);
+        // 获取当前播放进度
+        if let Some(player) = &self.player {
+            match player.get_position().map(|d| d.as_secs_f64()) {
+                Ok(pos) => {
+                    self.current_time = pos;
+                    self.last_valid_pos = Some((Instant::now(), pos));
+                }
+                Err(_) => {
+                    // 根据最后一次有效位置和流逝时间估算
+                    if let Some((time, pos)) = self.last_valid_pos {
+                        let delta = Instant::now().duration_since(time).as_secs_f64();
+                        self.current_time = pos + delta;
+                    }
+                }
+            }
+        }
 
-        self.current_time += delta;
-        self.current_time %= self.total_duration().unwrap_or(0.0);
-
+        // 更新滚动位置
         if let Some(pos) = self.find_current_line() {
-            self.scroll_offset = pos.saturating_sub(5); // 保持当前行在中间
+            let visible_lines = 10; // 根据实际UI高度调整
+            self.scroll_offset = pos.saturating_sub(visible_lines / 2);
         }
 
         Ok(())
@@ -462,16 +519,6 @@ impl AppState {
         self.lyrics
             .binary_search_by(|line| line.timestamp.partial_cmp(&self.current_time).unwrap())
             .ok()
-    }
-
-    fn total_duration(&self) -> Option<f64> {
-        self.lyrics.last().map(|line| line.timestamp)
-    }
-
-    fn update_progress(&mut self, delta: f64) {
-        if let Some(song) = &mut self.current_song {
-            song.duration = (song.duration - delta).max(0.0);
-        }
     }
 }
 
@@ -549,25 +596,24 @@ async fn run() -> Result<()> {
 
         // 渲染界面
         terminal.draw(|f| {
-            //     let chunks = Layout::default()
-            //         .margin(1)
-            //         .constraints([Constraint::Percentage(100)])
-            //         .split(f.size());
-
-            //     f.render_widget(LyricWidget(&app_state), chunks);
-
             // 创建垂直布局
-            let main_layout = Layout::default()
+            let layout = Layout::default()
                 .direction(Direction::Vertical)
                 .margin(1)
-                .constraints([Constraint::Percentage(100)])
+                .constraints([
+                    Constraint::Percentage(3), // 标题栏目
+                    Constraint::Min(1),        // 歌词区域
+                ])
                 .split(f.size());
 
-            // 获取主内容区域
-            let content_area = main_layout.first().unwrap();
+            // 渲染标题区块
+            let title_block = Block::default()
+                .borders(Borders::BOTTOM)
+                .style(Style::default().fg(Color::LightBlue));
+            f.render_widget(title_block, layout[0]);
 
             // 渲染到第一个子区域
-            f.render_widget(LyricWidget(&app_state), *content_area);
+            f.render_widget(LyricWidget(&app_state), layout[1]);
         })?;
 
         // 控制刷新率（每秒20帧）
