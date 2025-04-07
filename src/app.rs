@@ -6,22 +6,19 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal, Frame,
     layout::{Constraint, Direction, Layout},
-    style::{Color, Style},
-    widgets::{Block, Borders},
 };
 use tokio_stream::StreamExt;
 
 #[derive(Clone, Default)]
 
 pub struct App {
-    counter: i32,
     exit: bool,
 
     lyric_widget: LyricWidget,
 }
 
 impl App {
-    const FRAMES_PER_SECOND: f32 = 60.0;
+    const FRAMES_PER_SECOND: f32 = 30.0;
 
     // 保持UI和主循环不变
     pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -43,26 +40,24 @@ impl App {
 
     fn draw(&mut self, frame: &mut Frame) {
         // 创建垂直布局
-        let layout = Layout::default()
-            .direction(Direction::Vertical)
-            .margin(1)
-            .constraints([
-                Constraint::Percentage(3), // 标题栏目
-                Constraint::Min(1),        // 歌词区域
-            ])
-            .split(frame.area());
+        let chunks = Layout::new(
+            Direction::Vertical,
+            [
+                Constraint::Length(4), // 标题栏目
+                Constraint::Length(1), // 进度
+                Constraint::Min(1),    // 歌词区域
+            ],
+        );
 
-        // 渲染标题区块
-        let title_block = Block::default()
-            .borders(Borders::BOTTOM)
-            .style(Style::default().fg(Color::LightBlue));
-        frame.render_widget(title_block, layout[0]);
+        let [header_chunk, gauge_chunk, lyric_chunk] = chunks.areas(frame.area());
 
-        let size = layout[1].as_size();
+        let size = lyric_chunk.as_size();
         self.lyric_widget.update_size(size);
 
-        // 渲染到第一个子区域
-        frame.render_widget(&self.lyric_widget, layout[1]);
+        let buf = frame.buffer_mut();
+        self.lyric_widget.title_render(header_chunk, buf);
+        self.lyric_widget.gauge_render(gauge_chunk, buf);
+        self.lyric_widget.lyric_render(lyric_chunk, buf);
     }
 
     fn handle_event(&mut self, event: &Event) {
