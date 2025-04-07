@@ -1,16 +1,14 @@
 use anyhow::Result;
+use async_trait::async_trait;
 use base64::prelude::*;
+use chrono::Local;
 use clap::Parser;
-use crossterm::{
-    event::{self, Event, KeyCode},
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
+// use color_eyre::Result;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use dirs::home_dir;
 use mpris::{Player, PlayerFinder};
 use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
+    DefaultTerminal, Frame,
     buffer::Buffer,
     layout::{Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style},
@@ -19,15 +17,15 @@ use ratatui::{
 use ropey::Rope;
 use sanitize_filename::sanitize;
 use serde_json::Value;
+use std::io::Write;
 use std::{
-    cmp::min,
-    fs,
-    path::{Path, PathBuf},
+    fs::{self, OpenOptions},
+    path::PathBuf,
+    sync::OnceLock,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use strum::{EnumIter, IntoEnumIterator};
-
 use thiserror::Error;
+use tokio_stream::StreamExt;
 
 #[derive(Error, Debug)]
 pub enum LyricError {
@@ -77,12 +75,347 @@ const CACHE_DIR: &str = ".local/share/lyrics";
 #[clap(version, about)]
 struct Args;
 
-#[derive(Clone, Copy, Debug, EnumIter, strum::Display)]
-enum MusicSource {
-    Netease,
-    Kugou,
-    QQ,
-    Spotify,
+#[async_trait]
+trait LyricFetcher: Send + Sync {
+    async fn fetch_lyric(&self, song: &SongInfo) -> Result<String, LyricError>;
+    fn source_name(&self) -> &'static str;
+}
+
+// 公共基础结构
+struct BaseFetcher {
+    client: reqwest::Client,
+    retries: u8,
+}
+
+impl Default for BaseFetcher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BaseFetcher {
+    fn new() -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            retries: 3,
+        }
+    }
+
+    // 添加重试机制
+    async fn fetch_with_retry(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<Value, LyricError> {
+        let mut attempt = 0;
+        loop {
+            let response = request.try_clone().unwrap().send().await;
+            match response {
+                Ok(res) => return Ok(res.json().await?),
+                Err(_e) if attempt < self.retries => {
+                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                    attempt += 1;
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+}
+
+// 网易云音乐实现
+#[derive(Default)]
+struct NeteaseFetcher {
+    base: BaseFetcher,
+}
+
+#[async_trait]
+impl LyricFetcher for NeteaseFetcher {
+    async fn fetch_lyric(&self, song: &SongInfo) -> Result<String, LyricError> {
+        log::debug!("Get song: {:?}", song);
+        let search_url = "https://music.163.com/api/search/get/";
+
+        let request = self.base.client.get(search_url).query(&[
+            ("s", format!("{} {}", song.title, song.artist)),
+            ("type", "1".into()),
+            ("limit", "1".into()),
+        ]);
+
+        let json = self.base.fetch_with_retry(request).await?;
+        log::debug!("Get song: {:?}", json);
+        let song_id = json["result"]["songs"][0]["id"]
+            .as_u64()
+            .ok_or(LyricError::NoLyricFound)?;
+
+        let lyric_url = format!("https://music.163.com/api/song/lyric?id={}&lv=1", song_id);
+        let response = self.base.client.get(lyric_url).send().await?;
+
+        let json: Value = response.json().await?;
+        log::debug!("Get lyric: {:?}", json);
+        json["lrc"]["lyric"]
+            .as_str()
+            .filter(|&s| !s.is_empty())
+            .map(|s| s.to_string())
+            .ok_or(LyricError::NoLyricFound)
+    }
+
+    fn source_name(&self) -> &'static str {
+        "Netease"
+    }
+}
+
+// QQ音乐实现
+#[derive(Default)]
+struct QQMusicFetcher {
+    base: BaseFetcher,
+}
+
+#[async_trait]
+impl LyricFetcher for QQMusicFetcher {
+    async fn fetch_lyric(&self, song: &SongInfo) -> Result<String, LyricError> {
+        // 1. 搜索歌曲
+        let search_url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp";
+        let response = self
+            .base
+            .client
+            .get(search_url)
+            .query(&[
+                ("w", format!("{} {}", song.title, song.artist).as_str()),
+                ("format", "json"),
+                ("n", "1"),
+                ("cr", "1"),
+                ("g_tk", "5381"),
+            ])
+            .header("Referer", "https://y.qq.com/")
+            .header("Host", "c.y.qq.com")
+            .send()
+            .await?;
+
+        let json: Value = response.json().await?;
+        let song_list = json["data"]["song"]["list"]
+            .as_array()
+            .ok_or(LyricError::NoLyricFound)?;
+
+        let song_mid = song_list[0]["songmid"]
+            .as_str()
+            .ok_or(LyricError::NoLyricFound)?;
+
+        // 2. 获取歌词
+        let lyric_url = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric.fcg";
+        let response = self
+            .base
+            .client
+            .get(lyric_url)
+            .query(&[("songmid", song_mid), ("format", "json"), ("g_tk", "5381")])
+            .header("Referer", "https://y.qq.com/")
+            .header("Host", "c.y.qq.com")
+            .send()
+            .await?;
+
+        let json: Value = response.json().await?;
+        let lyric = json["lyric"].as_str().ok_or(LyricError::NoLyricFound)?;
+
+        // 处理Base64解码
+        let decoded = BASE64_STANDARD
+            .decode(lyric)
+            .map_err(|_| LyricError::LyricDecodeError)?;
+
+        let re = String::from_utf8(decoded).map_err(|_| LyricError::LyricDecodeError)?;
+        if re.is_empty() {
+            return Err(LyricError::NoLyricFound);
+        }
+        Ok(re)
+    }
+
+    fn source_name(&self) -> &'static str {
+        "QQMusic"
+    }
+}
+
+// Kugou音乐实现
+#[derive(Default)]
+struct KugouFetcher {
+    base: BaseFetcher,
+}
+
+impl KugouFetcher {
+    // 酷狗歌词解密函数
+    fn decode_lyric(&self, encrypted: &str) -> Result<String, LyricError> {
+        let bytes = BASE64_STANDARD.decode(encrypted)?;
+        let key = b"kg@lrc$okm0qaz";
+        let decrypted: Vec<u8> = bytes
+            .iter()
+            .enumerate()
+            .map(|(i, &b)| b ^ key[i % key.len()])
+            .collect();
+        let re = String::from_utf8(decrypted).map_err(|_| LyricError::LyricDecodeError)?;
+        if re.is_empty() {
+            return Err(LyricError::NoLyricFound);
+        }
+        Ok(re)
+    }
+}
+
+#[async_trait]
+impl LyricFetcher for KugouFetcher {
+    async fn fetch_lyric(&self, song: &SongInfo) -> Result<String, LyricError> {
+        // 1. 搜索歌曲
+        let search_url = "http://mobilecdn.kugou.com/api/v3/search/song";
+        let response = self
+            .base
+            .client
+            .get(search_url)
+            .query(&[
+                (
+                    "keyword",
+                    format!("{} {}", song.title, song.artist).as_str(),
+                ),
+                ("page", "1"),
+                ("pagesize", "1"),
+            ])
+            .send()
+            .await?;
+
+        let json: Value = response.json().await?;
+        let songs = json["data"]["info"]
+            .as_array()
+            .ok_or(LyricError::NoLyricFound)?;
+
+        let song_hash = songs[0]["hash"].as_str().ok_or(LyricError::NoLyricFound)?;
+        let album_id = songs[0]["album_id"]
+            .as_str()
+            .ok_or(LyricError::NoLyricFound)?;
+
+        let current_timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        // 2. 获取歌词
+        let lyric_url = "http://krcs.kugou.com/search";
+        let response = self
+            .base
+            .client
+            .get(lyric_url)
+            .query(&[
+                (
+                    "keyword",
+                    format!("{} {}", song.title, song.artist).as_str(),
+                ),
+                ("hash", song_hash),
+                ("album_id", album_id),
+                ("_", &current_timestamp.to_string()),
+            ])
+            .header("User-Agent", "Mozilla/5.0")
+            .send()
+            .await?;
+
+        let json: Value = response.json().await?;
+        let lyric = json["content"].as_str().ok_or(LyricError::NoLyricFound)?;
+
+        // 处理酷狗特有的加密歌词
+        let decoded = self.decode_lyric(lyric)?;
+        Ok(decoded)
+    }
+
+    fn source_name(&self) -> &'static str {
+        "Kugou"
+    }
+}
+
+// Spotify音乐实现
+#[derive(Default)]
+struct SpotifyFetcher {
+    base: BaseFetcher,
+}
+
+#[async_trait]
+impl LyricFetcher for SpotifyFetcher {
+    async fn fetch_lyric(&self, song: &SongInfo) -> Result<String, LyricError> {
+        // 假设使用的第三方Spotify歌词API如下（实际应使用真实的API）
+        let search_url = "https://api.thirdparty.com/spotify/lyrics";
+        let response = self
+            .base
+            .client
+            .get(search_url)
+            .query(&[("track", &song.title), ("artist", &song.artist)])
+            .send()
+            .await?;
+
+        let json: Value = response.json().await?;
+        let lyric = json["lyrics"].as_str().ok_or(LyricError::NoLyricFound)?;
+
+        if lyric.is_empty() {
+            return Err(LyricError::NoLyricFound);
+        }
+
+        // 假设第三方API返回的歌词不需要解码或特殊处理
+        Ok(lyric.to_string())
+    }
+
+    fn source_name(&self) -> &'static str {
+        "Spotify"
+    }
+}
+
+fn get_lyric_client() -> &'static LyricClient {
+    static CLIENT: OnceLock<LyricClient> = OnceLock::new();
+    CLIENT.get_or_init(|| LyricClient::new())
+}
+
+// 统一调用入口
+#[derive(Default)]
+struct LyricClient {
+    fetchers: Vec<Box<dyn LyricFetcher>>,
+    cache: CacheManager,
+}
+
+impl LyricClient {
+    fn new() -> Self {
+        Self {
+            fetchers: vec![
+                Box::new(NeteaseFetcher::default()),
+                // Box::new(QQMusicFetcher::default()),
+                // Box::new(KugouFetcher::new()),
+                // Box::new(SpotifyFetcher::new()),
+            ],
+            cache: CacheManager::new(),
+        }
+    }
+
+    async fn get_lyric(&self, song: &SongInfo) -> Result<Rope, LyricError> {
+        if let Some(cached) = self.cache.get(song).await {
+            log::debug!("Cache lyric for: {} - {}", song.artist, song.title);
+            return Ok(cached);
+        }
+
+        for fetcher in &self.fetchers {
+            log::debug!("Trying source: {}", fetcher.source_name());
+            match fetcher.fetch_lyric(song).await {
+                Ok(lyric) => {
+                    //if self.validate_lyric(song, &lyric) {
+                    log::info!("Successfully fetched from {}", fetcher.source_name());
+                    self.cache
+                        .store(song, fetcher.source_name(), &lyric)
+                        .await?;
+                    return Ok(Rope::from(lyric));
+                    // }
+                }
+                Err(e) => log::warn!("{} failed: {}", fetcher.source_name(), e),
+            }
+        }
+        Err(LyricError::NoLyricFound)
+    }
+
+    #[allow(dead_code)]
+    fn validate_lyric(&self, song: &SongInfo, lyric: &str) -> bool {
+        let normalized_lyric = normalize_text(lyric);
+        let has_title = normalized_lyric.contains(&normalize_text(&song.title));
+        let has_artist = normalized_lyric.contains(&normalize_text(&song.artist));
+
+        // 额外检查时长标签（如果有）
+        let has_duration = lyric.contains(&format!("{:0.1}", song.duration));
+
+        has_title && has_artist && (song.duration <= 0.0 || has_duration)
+    }
 }
 
 fn normalize_text(s: &str) -> String {
@@ -92,370 +425,48 @@ fn normalize_text(s: &str) -> String {
         .to_string()
 }
 
-async fn fetch_lyric(song: &SongInfo) -> Result<Rope, LyricError> {
-    let normalized = song.normalized();
+// 缓存管理模块
+#[derive(Debug, Clone, Default)]
+struct CacheManager {
+    base_dir: PathBuf,
+}
 
-    // 尝试从缓存查找
-    if let Ok(cached) = check_cached_lyrics(&normalized).await {
-        return Ok(cached);
-    }
+impl CacheManager {
+    fn new() -> Self {
+        let mut path = home_dir().expect("Failed to get home directory");
+        path.push(".local/share/lyrics");
 
-    // 依次尝试不同来源
-    for source in MusicSource::iter() {
-        match try_fetch_from_source(&normalized, source).await {
-            Ok(lyric) => return Ok(lyric),
-            Err(e) => eprintln!("{} error: {}", source, e),
+        if !path.exists() {
+            fs::create_dir_all(&path).unwrap();
         }
+
+        Self { base_dir: path }
     }
 
-    Err(LyricError::NoLyricFound)
-}
-
-async fn check_cached_lyrics(song: &SongInfo) -> Result<Rope, LyricError> {
-    let mut candidates: Vec<_> = MusicSource::iter()
-        .filter_map(|source| {
-            let path = get_cache_path(song, source).ok()?;
-            if path.exists() {
-                let modified = fs::metadata(&path).ok()?.modified().ok()?;
-                Some((path, modified))
-            } else {
-                None
-            }
-        })
-        .collect();
-
-    // 按修改时间排序，选择最新的缓存
-    candidates.sort_by(|a, b| b.1.cmp(&a.1));
-    let path = candidates
-        .first()
-        .map(|(p, _)| p)
-        .ok_or(LyricError::NoLyricFound)?;
-
-    let content = tokio::fs::read_to_string(&path).await?;
-    Ok(Rope::from_str(&content))
-}
-
-async fn try_fetch_from_source(song: &SongInfo, source: MusicSource) -> Result<Rope, LyricError> {
-    let lyric = match source {
-        MusicSource::Netease => fetch_netease(song).await,
-        MusicSource::QQ => fetch_qqmusic(song).await,
-        MusicSource::Kugou => fetch_kugou(song).await,
-        MusicSource::Spotify => fetch_spotify(song).await,
-    }?;
-
-    if verify_lyric(song, &lyric) {
-        let path = get_cache_path(song, source)?;
-        tokio::fs::write(path, &lyric).await?;
-        Ok(Rope::from(lyric))
-    } else {
-        Err(LyricError::LyricValidationFailed)
+    fn lyric_name(&self, song: &SongInfo) -> PathBuf {
+        let file_name = format!("{}_{}.lrc", sanitize(&song.artist), sanitize(&song.title));
+        let mut path = self.base_dir.clone();
+        path.push(file_name);
+        path
     }
-}
 
-fn verify_lyric(song: &SongInfo, lyric: &str) -> bool {
-    let normalized_lyric = normalize_text(lyric);
-    let has_title = normalized_lyric.contains(&normalize_text(&song.title));
-    let has_artist = normalized_lyric.contains(&normalize_text(&song.artist));
-
-    // 额外检查时长标签（如果有）
-    let has_duration = lyric.contains(&format!("{:0.1}", song.duration));
-
-    has_title && has_artist && (song.duration <= 0.0 || has_duration)
-}
-
-// 添加重试机制
-async fn fetch_with_retry(
-    client: &reqwest::Client,
-    url: &str,
-    retries: u8,
-) -> Result<reqwest::Response, reqwest::Error> {
-    let mut attempt = 0;
-    let mut backoff = 1;
-
-    loop {
-        match client.get(url).send().await {
-            Ok(res) => return Ok(res),
-            Err(e) if attempt < retries => {
-                tokio::time::sleep(Duration::from_secs(backoff)).await;
-                attempt += 1;
-                backoff *= 2;
-            }
-            Err(e) => return Err(e),
+    async fn get(&self, song: &SongInfo) -> Option<Rope> {
+        let path = self.lyric_name(song);
+        if !path.exists() {
+            return None;
         }
-    }
-}
-// 网易云实现
-async fn fetch_netease(song: &SongInfo) -> Result<String, LyricError> {
-    let client = reqwest::Client::new();
-    let search_url = "https://music.163.com/api/search/get/";
 
-    let response = client
-        .get(search_url)
-        .query(&[
-            ("s", format!("{} {}", song.title, song.artist)),
-            ("type", "1".into()),
-            ("limit", "1".into()),
-        ])
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let song_id = json["result"]["songs"][0]["id"]
-        .as_u64()
-        .ok_or(LyricError::NoLyricFound)?;
-
-    let lyric_url = format!("https://music.163.com/api/song/lyric?id={}&lv=1", song_id);
-    let response = client.get(lyric_url).send().await?;
-
-    let json: Value = response.json().await?;
-    json["lrc"]["lyric"]
-        .as_str()
-        .map(|s| s.to_string())
-        .ok_or(LyricError::NoLyricFound)
-}
-
-async fn fetch_qqmusic(song: &SongInfo) -> Result<String, LyricError> {
-    let client = reqwest::Client::new();
-
-    // 1. 搜索歌曲
-    let search_url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp";
-    let response = client
-        .get(search_url)
-        .query(&[
-            ("w", format!("{} {}", song.title, song.artist)),
-            ("format", "json".into()),
-            ("n", "1".into()),
-            ("cr", "1".into()),
-            ("g_tk", "5381".into()),
-        ])
-        .header("Referer", "https://y.qq.com/")
-        .header("Host", "c.y.qq.com")
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let song_list = json["data"]["song"]["list"]
-        .as_array()
-        .ok_or(LyricError::NoLyricFound)?;
-
-    let song_mid = song_list[0]["songmid"]
-        .as_str()
-        .ok_or(LyricError::NoLyricFound)?;
-
-    // 2. 获取歌词
-    let lyric_url = "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric.fcg";
-    let response = client
-        .get(lyric_url)
-        .query(&[
-            ("songmid", song_mid),
-            ("format", "json".into()),
-            ("g_tk", "5381".into()),
-        ])
-        .header("Referer", "https://y.qq.com/")
-        .header("Host", "c.y.qq.com")
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let lyric = json["lyric"].as_str().ok_or(LyricError::NoLyricFound)?;
-
-    // 处理Base64解码
-    let decoded = BASE64_STANDARD
-        .decode(lyric)
-        .map_err(|_| LyricError::LyricDecodeError)?;
-
-    String::from_utf8(decoded).map_err(|_| LyricError::LyricDecodeError)
-}
-
-async fn fetch_kugou(song: &SongInfo) -> Result<String, LyricError> {
-    let client = reqwest::Client::new();
-
-    // 1. 搜索歌曲
-    let search_url = "http://mobilecdn.kugou.com/api/v3/search/song";
-    let response = client
-        .get(search_url)
-        .query(&[
-            ("keyword", format!("{} {}", song.title, song.artist)),
-            ("page", "1".into()),
-            ("pagesize", "1".into()),
-        ])
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let songs = json["data"]["info"]
-        .as_array()
-        .ok_or(LyricError::NoLyricFound)?;
-
-    let song_hash = songs[0]["hash"].as_str().ok_or(LyricError::NoLyricFound)?;
-    let album_id = songs[0]["album_id"]
-        .as_str()
-        .ok_or(LyricError::NoLyricFound)?;
-
-    let current_timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-
-    // 2. 获取歌词
-    let lyric_url = "http://krcs.kugou.com/search";
-    let response = client
-        .get(lyric_url)
-        .query(&[
-            ("keyword", format!("{} {}", song.title, song.artist)),
-            ("hash", song_hash.to_string()),
-            ("album_id", album_id.to_string()),
-            ("_", current_timestamp.to_string()),
-        ])
-        .header("User-Agent", "Mozilla/5.0")
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let lyric = json["content"].as_str().ok_or(LyricError::NoLyricFound)?;
-
-    // 处理酷狗特有的加密歌词
-    let decoded = decode_kugou_lyric(lyric)?;
-    Ok(decoded)
-}
-
-// 酷狗歌词解密函数
-fn decode_kugou_lyric(encrypted: &str) -> Result<String, LyricError> {
-    let bytes = BASE64_STANDARD.decode(encrypted)?;
-    let key = b"kg@lrc$okm0qaz";
-    let decrypted: Vec<u8> = bytes
-        .iter()
-        .enumerate()
-        .map(|(i, &b)| b ^ key[i % key.len()])
-        .collect();
-    String::from_utf8(decrypted).map_err(|_| LyricError::LyricDecodeError)
-}
-
-// QQ音乐实现
-// async fn fetch_qqmusic(song: &SongInfo) -> Result<String, LyricError> {
-//     let client = reqwest::Client::new();
-//     let search_url = "https://c.y.qq.com/soso/fcgi-bin/client_search_cp";
-
-//     let response = client
-//         .get(search_url)
-//         .query(&[
-//             ("w", format!("{} {}", song.title, song.artist)),
-//             ("format", "json".into()),
-//             ("n", "1".into()),
-//             ("ct", "24".into()),
-//             ("qqmusic_ver", "1298".into()),
-//             ("new_json", "1".into()),
-//             ("p", "1".into()),
-//             ("n", "5".into()),
-//         ])
-//         .header("Referer", "https://y.qq.com")
-//         .send()
-//         .await?;
-
-//     let json: Value = response.json().await?;
-//     let song_id = json["data"]["song"]["list"][0]["songid"]
-//         .as_str()
-//         .ok_or(LyricError::NoLyricFound)?;
-
-//     let lyric_url = format!(
-//         "https://c.y.qq.com/lyric/fcgi-bin/fcg_query_lyric_yqq.fcg?songmid={}&format=json",
-//         song_id
-//     );
-//     let response = client
-//         .get(lyric_url)
-//         .header("Referer", "https://y.qq.com")
-//         .send()
-//         .await?;
-
-//     let json: Value = response.json().await?;
-//     let lyric = json["lyric"].as_str().ok_or(LyricError::NoLyricFound)?;
-
-//     let decoded = BASE64_STANDARD
-//         .decode(lyric)
-//         .map_err(|_| LyricError::LyricDecodeError)?;
-
-//     String::from_utf8(decoded).map_err(|_| LyricError::LyricDecodeError)
-// }
-
-// async fn fetch_kugou(song: &SongInfo) -> Result<String, LyricError> {
-//     let client = reqwest::Client::new();
-//     // 假设酷狗音乐的搜索API和参数如下（实际应使用真实的API和参数）
-//     let search_url = "https://example.com/kugou/search";
-//     let response = client
-//         .get(search_url)
-//         .query(&[
-//             ("keywords", format!("{} {}", song.title, song.artist)),
-//             // 其他可能的参数
-//         ])
-//         .send()
-//         .await?;
-
-//     let json: Value = response.json().await?;
-//     // 解析JSON以获取歌曲ID和歌词URL（实际实现取决于API的返回结构）
-//     let song_id = json["data"]["song_list"][0]["song_id"]
-//         .as_str()
-//         .ok_or(LyricError::NoLyricFound)?;
-//     let lyric_url = format!("https://example.com/kugou/lyric?song_id={}", song_id);
-
-//     let response = client.get(lyric_url).send().await?;
-//     let json: Value = response.json().await?;
-//     let lyric = json["lyric"].as_str().ok_or(LyricError::NoLyricFound)?;
-
-//     // 假设酷狗音乐的歌词不需要解码或特殊处理
-//     Ok(lyric.to_string())
-// }
-
-async fn fetch_spotify(song: &SongInfo) -> Result<String, LyricError> {
-    let client = reqwest::Client::new();
-    // 假设使用的第三方Spotify歌词API如下（实际应使用真实的API）
-    let search_url = "https://api.thirdparty.com/spotify/lyrics";
-    let response = client
-        .get(search_url)
-        .query(&[("track", &song.title), ("artist", &song.artist)])
-        .send()
-        .await?;
-
-    let json: Value = response.json().await?;
-    let lyric = json["lyrics"].as_str().ok_or(LyricError::NoLyricFound)?;
-
-    // 假设第三方API返回的歌词不需要解码或特殊处理
-    Ok(lyric.to_string())
-}
-
-// 更新缓存路径生成
-fn get_cache_path(song: &SongInfo, source: MusicSource) -> Result<PathBuf, LyricError> {
-    let mut path = home_dir().ok_or(LyricError::CachePathError)?;
-    path.push(CACHE_DIR);
-
-    if !path.exists() {
-        fs::create_dir_all(&path)?;
+        tokio::fs::read_to_string(&path)
+            .await
+            .map(|s| Rope::from_str(&s))
+            .ok()
     }
 
-    let filename = match source {
-        MusicSource::Netease => format!(
-            "netease_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-        MusicSource::QQ => format!(
-            "qqmusic_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-        MusicSource::Kugou => format!(
-            "kugou_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-        MusicSource::Spotify => format!(
-            "spotify_{}_{}.lrc",
-            sanitize(&song.artist),
-            sanitize(&song.title)
-        ),
-    };
-
-    path.push(filename);
-    Ok(path)
+    async fn store(&self, song: &SongInfo, _source: &str, content: &str) -> Result<(), LyricError> {
+        let path = self.lyric_name(song);
+        tokio::fs::write(path, &content).await?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -466,6 +477,7 @@ struct SongInfo {
 }
 
 impl SongInfo {
+    #[allow(dead_code)]
     fn normalized(&self) -> Self {
         Self {
             title: normalize_text(&self.title),
@@ -482,11 +494,7 @@ fn is_valid_player(player: &Player) -> bool {
     !blacklist_keywords.iter().any(|k| identity.contains(k))
 }
 
-fn get_current_song() -> Result<(Player, SongInfo), LyricError> {
-    // let player = PlayerFinder::new()?;
-    // .find_active()
-    // .map_err(|_| LyricError::NoPlayerFound)?;
-
+fn get_current_song() -> Result<SongInfo, LyricError> {
     let player_finder = PlayerFinder::new()?;
     let player = player_finder
         .find_all()?
@@ -502,14 +510,43 @@ fn get_current_song() -> Result<(Player, SongInfo), LyricError> {
     let artist = metadata.artists().map(|a| a.join(", ")).unwrap_or_default();
     let duration = metadata.length().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
-    Ok((
-        player,
-        SongInfo {
-            title,
-            artist,
-            duration,
-        },
-    ))
+    Ok(SongInfo {
+        title,
+        artist,
+        duration,
+    })
+}
+
+/// 播放时间
+#[derive(Debug, Clone, PartialEq, Default)]
+struct PlayTime {
+    /// 当前时间
+    current_time: f64,
+    /// 最后校正时间
+    last_valid_pos: Option<(Instant, f64)>,
+}
+
+fn get_current_time_song(st: PlayTime) -> Result<PlayTime, LyricError> {
+    let player = PlayerFinder::new()?
+        .find_active()
+        .map_err(|_| LyricError::NoPlayerFound)?;
+    let mut st = st;
+
+    match player.get_position().map(|d| d.as_secs_f64()) {
+        Ok(pos) => {
+            st.current_time = pos;
+            st.last_valid_pos = Some((Instant::now(), pos));
+        }
+        Err(_) => {
+            // 根据最后一次有效位置和流逝时间估算
+            if let Some((time, pos)) = st.last_valid_pos {
+                let delta = Instant::now().duration_since(time).as_secs_f64();
+                st.current_time = pos + delta;
+            }
+        }
+    }
+
+    Ok(st)
 }
 
 // 解析主逻辑
@@ -580,7 +617,7 @@ impl LyricParser {
     }
 
     fn parse_time(s: &str) -> Option<f64> {
-        let parts: Vec<&str> = s.split(|c| c == ':' || c == '.').collect();
+        let parts: Vec<&str> = s.split(&[':', '.']).collect();
         if parts.len() < 2 {
             return None;
         }
@@ -608,42 +645,27 @@ struct LyricLine {
 struct ViewMetrics {
     visible_lines: usize,   // 可见行数
     content_height: usize,  // 总内容高度
-    viewport_height: usize, // 视口高度
     scroll_range: usize,    // 最大可滚动范围
+    viewport_height: usize, // 视口高度
     line_height: u16,       // 单行高度
 }
+
 // 界面状态管理
+#[derive(Clone, Default)]
 struct AppState {
-    player: Option<Player>,
     current_song: Option<SongInfo>,
+    play_time: PlayTime,
     lyrics: Vec<LyricLine>,
-    target_scroll: usize, // 目标滚动位置
-    current_scroll: f64,  // 当前实际滚动位置
-    current_time: f64,
-    last_valid_pos: Option<(Instant, f64)>,
+    target_scroll: usize,          // 目标滚动位置
+    current_scroll: f64,           // 当前实际滚动位置
     view_metrics: ViewMetrics,     // 新增显示参数
     error_message: Option<String>, // 新增错误状态
     retry_counter: u32,            // 重试计数器
 }
 
 impl AppState {
-    fn new() -> Self {
-        Self {
-            player: None,
-            current_song: None,
-            lyrics: Vec::new(),
-            target_scroll: 0,
-            current_scroll: 0.0,
-            current_time: 0.0,
-            last_valid_pos: None,
-            view_metrics: ViewMetrics::default(),
-            error_message: None,
-            retry_counter: 0,
-        }
-    }
-
     // 预计算显示参数
-    fn calculate_metrics(&mut self, area: Size) {
+    pub fn calculate_metrics(&mut self, area: Size) {
         let content_height = self.lyrics.len();
         let viewport_height = area.height as usize;
         let visible_lines = viewport_height.saturating_sub(2); // 保留边界空间
@@ -652,16 +674,16 @@ impl AppState {
         self.view_metrics = ViewMetrics {
             visible_lines,
             content_height,
-            viewport_height: viewport_height as usize,
             scroll_range,
+            viewport_height: viewport_height as usize,
             line_height: 1, // 假设单行高度为1
         };
     }
 
-    async fn update(&mut self, area: Size) {
+    async fn update(&mut self) {
         self.error_message = None; // 清除旧错误        
 
-        match self.try_update(area).await {
+        match self.try_update().await {
             Ok(_) => self.retry_counter = 0,
             Err(e) => {
                 self.handle_error(e).await;
@@ -669,44 +691,27 @@ impl AppState {
         }
     }
 
-    async fn try_update(&mut self, area: Size) -> Result<(), LyricError> {
-        self.calculate_metrics(area); // 在更新时计算显示参数        
+    async fn try_update(&mut self) -> Result<(), LyricError> {
         // 获取当前播放器和歌曲信息
         let result = get_current_song();
-        let (new_player, new_song) = match result {
-            Ok((p, s)) => (Some(p), s),
+        let new_song = match result {
+            Ok(s) => s,
             Err(LyricError::NoPlayerFound) => {
-                self.player = None;
+                // self.player = None.into();
                 self.current_song = None;
                 self.lyrics.clear();
                 return Ok(());
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e),
         };
 
         // 歌曲发生变化时重新加载歌词
         if Some(new_song.clone()) != self.current_song {
             self.handle_song_change(new_song).await?;
-            self.player = new_player;
-            self.calculate_metrics(area); // 歌词变化后重新计算
         }
 
         // 获取当前播放进度
-        if let Some(player) = &self.player {
-            match player.get_position().map(|d| d.as_secs_f64()) {
-                Ok(pos) => {
-                    self.current_time = pos;
-                    self.last_valid_pos = Some((Instant::now(), pos));
-                }
-                Err(_) => {
-                    // 根据最后一次有效位置和流逝时间估算
-                    if let Some((time, pos)) = self.last_valid_pos {
-                        let delta = Instant::now().duration_since(time).as_secs_f64();
-                        self.current_time = pos + delta;
-                    }
-                }
-            }
-        }
+        self.play_time = get_current_time_song(self.play_time.clone())?;
 
         // 更新滚动位置
         if let Some(pos) = self.find_current_line() {
@@ -728,9 +733,8 @@ impl AppState {
         self.current_scroll = 0.0;
 
         if let Some(song) = &self.current_song {
-            let doc = fetch_lyric(&song).await?;
-            self.lyrics = LyricParser::parse(&doc, song.duration)
-                .expect("Failed to load lyrics for {song.title}");
+            let doc = get_lyric_client().get_lyric(song).await?;
+            self.lyrics = LyricParser::parse(&doc, song.duration)?;
         }
 
         Ok(())
@@ -741,7 +745,8 @@ impl AppState {
             .iter()
             .enumerate()
             .find(|(_, line)| {
-                self.current_time >= line.timestamp_start && self.current_time < line.timestamp_end
+                self.play_time.current_time >= line.timestamp_start
+                    && self.play_time.current_time < line.timestamp_end
             })
             .map(|(i, _)| i)
     }
@@ -749,38 +754,54 @@ impl AppState {
     async fn handle_error(&mut self, error: LyricError) {
         self.retry_counter += 1;
         let error_msg = format!("Error: {} (Retry {}/5)", error, self.retry_counter);
+
+        log::error!("{}", error_msg);
         self.error_message = Some(error_msg);
 
-        // 自动重试逻辑
         if self.retry_counter < 5 {
+            log::debug!("Retrying in 2 seconds...");
             tokio::time::sleep(Duration::from_secs(2)).await;
         } else {
-            self.error_message = Some("Maximum retries reached".into());
+            log::error!("Maximum retries reached");
+            // self.error_message = Some("Maximum retries reached".into());
         }
     }
 }
 
 // 界面渲染
-struct LyricWidget<'a>(&'a AppState);
+#[derive(Clone, Default)]
+struct LyricWidget {
+    state: AppState,
+}
 
-impl<'a> LyricWidget<'a> {
+impl LyricWidget {
+    async fn update(&mut self) {
+        self.state.update().await;
+    }
+
+    fn update_size(&mut self, size: Size) {
+        self.state.calculate_metrics(size);
+    }
+
     fn get_window_title(&self) -> String {
-        match &self.0.current_song {
+        match &self.state.current_song {
             Some(song) => format!(" Now Playing: {} ", song.title),
             None => " No song playing ".into(),
         }
     }
 }
 
-impl<'a> Widget for LyricWidget<'a> {
+impl Widget for &LyricWidget {
     fn render(self, area: Rect, buf: &mut Buffer) {
+        let state = &self.state;
+
         let block = Block::default()
             .title(self.get_window_title())
             .borders(Borders::ALL);
         block.render(area, buf);
 
         // 渲染错误信息
-        if let Some(err_msg) = &self.0.error_message {
+        if let Some(err_msg) = &state.error_message {
             let error_block = Paragraph::new(err_msg.clone())
                 .style(Style::default().fg(Color::Red))
                 .block(Block::default().borders(Borders::ALL));
@@ -789,14 +810,14 @@ impl<'a> Widget for LyricWidget<'a> {
         }
 
         // 显示歌曲信息
-        if let Some(song) = &self.0.current_song {
+        if let Some(song) = &state.current_song {
             let info_line = format!(
                 " ♫ {} - {} {:0>2}:{:0>2} / {:0>2}:{:0>2}
                 ",
                 song.artist,
                 song.title,
-                (self.0.current_time / 60.0).floor() as u64,
-                (self.0.current_time % 60.0).floor() as u64,
+                (&state.play_time.current_time / 60.0).floor() as u64,
+                (&state.play_time.current_time % 60.0).floor() as u64,
                 (song.duration / 60.0).floor() as u64,
                 (song.duration % 60.0).floor() as u64,
             );
@@ -809,21 +830,25 @@ impl<'a> Widget for LyricWidget<'a> {
         }
 
         // 使用预计算的显示参数
-        let metrics = self.0.view_metrics;
-        let scroll_pos = self.0.current_scroll as usize;
+        let metrics = &state.view_metrics;
+        let scroll_pos = state.current_scroll as usize;
         let start = scroll_pos.min(metrics.scroll_range);
         let end = (start + metrics.visible_lines).min(metrics.content_height);
-        for (i, line) in self.0.lyrics[start..end].iter().enumerate() {
+        for (i, line) in state.lyrics[start..end].iter().enumerate() {
             let y = area.y + i as u16;
-            let is_current = start + i == self.0.find_current_line().unwrap_or(0);
+            let is_current = start + i == state.find_current_line().unwrap_or(0);
 
             // 居中计算
+            #[cfg(debug_assertions)]
             let line_text = format!(
                 "[{:0>2}:{:0>2}] {}",
                 (line.timestamp_start / 60.0).floor() as u64,
                 (line.timestamp_start % 60.0).floor() as u64,
                 line.text
             );
+
+            #[cfg(not(debug_assertions))]
+            let line_text = format!("{}", line.text);
 
             let text_width = line_text.chars().count() as u16;
             let x = area.x + (area.width - text_width) / 2;
@@ -845,64 +870,136 @@ impl<'a> Widget for LyricWidget<'a> {
     }
 }
 
-// 保持UI和主循环不变
-async fn run() -> Result<()> {
-    let mut terminal = ratatui::init();
-    let mut app_state = AppState::new();
+#[derive(Clone, Default)]
+pub struct App {
+    counter: i32,
+    exit: bool,
 
-    loop {
-        // 获取当前终端尺寸
-        let size = terminal.size()?;
+    lyric_widget: LyricWidget,
+}
 
-        // 更新状态
-        app_state.update(size).await;
+impl App {
+    const FRAMES_PER_SECOND: f32 = 60.0;
 
-        // 渲染界面
-        terminal.draw(|frame| {
-            // 创建垂直布局
-            let layout = Layout::default()
-                .direction(Direction::Vertical)
-                .margin(1)
-                .constraints([
-                    Constraint::Percentage(3), // 标题栏目
-                    Constraint::Min(1),        // 歌词区域
-                ])
-                .split(frame.area());
+    // 保持UI和主循环不变
+    async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
+        let mut interval = tokio::time::interval(period);
+        let mut events = EventStream::new();
 
-            // 渲染标题区块
-            let title_block = Block::default()
-                .borders(Borders::BOTTOM)
-                .style(Style::default().fg(Color::LightBlue));
-            frame.render_widget(title_block, layout[0]);
+        while !self.exit {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.lyric_widget.update().await;
+                    terminal.draw(|frame| self.draw(frame))?;
+                },
+                Some(Ok(event)) = events.next() => self.handle_event(&event),
+            }
+        }
+        Ok(())
+    }
 
-            // 渲染到第一个子区域
-            frame.render_widget(LyricWidget(&app_state), layout[1]);
-        })?;
+    fn draw(&mut self, frame: &mut Frame) {
+        // 创建垂直布局
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Percentage(3), // 标题栏目
+                Constraint::Min(1),        // 歌词区域
+            ])
+            .split(frame.area());
 
-        // 控制刷新率（每秒20帧）
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // 渲染标题区块
+        let title_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .style(Style::default().fg(Color::LightBlue));
+        frame.render_widget(title_block, layout[0]);
 
-        // 处理退出
-        if event::poll(Duration::from_millis(0))? {
-            if let Event::Key(key) = event::read()? {
-                if key.code == KeyCode::Esc {
-                    break;
-                }
-                // 允许手动重试
-                if key.code == KeyCode::Char('r') {
-                    app_state.retry_counter = 0;
-                }
+        let size = layout[1].as_size();
+        self.lyric_widget.update_size(size);
+
+        // 渲染到第一个子区域
+        frame.render_widget(&self.lyric_widget, layout[1]);
+    }
+
+    fn handle_event(&mut self, event: &Event) {
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Press {
+                self.handle_key_event(key);
             }
         }
     }
 
-    ratatui::restore();
+    fn handle_key_event(&mut self, key_event: &KeyEvent) {
+        match key_event.code {
+            KeyCode::Char('q') => self.exit(),
+            KeyCode::Esc => self.exit(),
+            KeyCode::Left => self.decrement_counter(),
+            KeyCode::Right => self.increment_counter(),
+            _ => {}
+        }
+    }
+
+    fn exit(&mut self) {
+        self.exit = true;
+    }
+
+    fn increment_counter(&mut self) {
+        self.counter += 1;
+    }
+
+    fn decrement_counter(&mut self) {
+        self.counter -= 1;
+    }
+}
+
+pub fn init_logger() -> Result<()> {
+    // 日志文件路径（用户目录下的 .lyrics/logs/app.log）
+    let log_dir = dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".local/share/lyrics");
+
+    if !log_dir.exists() {
+        fs::create_dir_all(&log_dir).unwrap();
+    }
+
+    let log_file = log_dir.join("lyric.log");
+
+    // 配置日志输出到文件和终端
+    env_logger::Builder::new()
+        .format(|buf, record| {
+            writeln!(
+                buf,
+                "[{} {} {}] {}",
+                Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.module_path().unwrap_or(""),
+                record.args()
+            )
+        })
+        .filter(None, log::LevelFilter::Trace) // 默认日志级别
+        .target(env_logger::Target::Pipe(Box::new(
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)?,
+        )))
+        .try_init()?;
 
     Ok(())
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    init_logger()?;
+    log::info!("Starting lyric application...");
+
+    get_lyric_client();
+    // color_eyre::install()?;
     let _args = Args::parse();
-    run().await
+    let mut terminal = ratatui::init();
+    let app_result = App::default().run(&mut terminal).await;
+    ratatui::restore();
+    app_result
 }
