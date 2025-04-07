@@ -1,0 +1,92 @@
+use std::time::Duration;
+
+use crate::ui::LyricWidget;
+use anyhow::Result;
+use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::{
+    DefaultTerminal, Frame,
+    layout::{Constraint, Direction, Layout},
+    style::{Color, Style},
+    widgets::{Block, Borders},
+};
+use tokio_stream::StreamExt;
+
+#[derive(Clone, Default)]
+
+pub struct App {
+    counter: i32,
+    exit: bool,
+
+    lyric_widget: LyricWidget,
+}
+
+impl App {
+    const FRAMES_PER_SECOND: f32 = 60.0;
+
+    // 保持UI和主循环不变
+    pub async fn run(&mut self, terminal: &mut DefaultTerminal) -> Result<()> {
+        let period = Duration::from_secs_f32(1.0 / Self::FRAMES_PER_SECOND);
+        let mut interval = tokio::time::interval(period);
+        let mut events = EventStream::new();
+
+        while !self.exit {
+            tokio::select! {
+                _ = interval.tick() => {
+                    self.lyric_widget.update().await;
+                    terminal.draw(|frame| self.draw(frame))?;
+                },
+                Some(Ok(event)) = events.next() => self.handle_event(&event),
+            }
+        }
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &mut Frame) {
+        // 创建垂直布局
+        let layout = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Percentage(3), // 标题栏目
+                Constraint::Min(1),        // 歌词区域
+            ])
+            .split(frame.area());
+
+        // 渲染标题区块
+        let title_block = Block::default()
+            .borders(Borders::BOTTOM)
+            .style(Style::default().fg(Color::LightBlue));
+        frame.render_widget(title_block, layout[0]);
+
+        let size = layout[1].as_size();
+        self.lyric_widget.update_size(size);
+
+        // 渲染到第一个子区域
+        frame.render_widget(&self.lyric_widget, layout[1]);
+    }
+
+    fn handle_event(&mut self, event: &Event) {
+        if let Event::Key(key) = event {
+            if key.kind == KeyEventKind::Press {
+                self.handle_key_event(key);
+            }
+        }
+    }
+
+    fn handle_key_event(&mut self, key_event: &KeyEvent) {
+        match key_event.code {
+            KeyCode::Char('q') => self.exit(),
+            KeyCode::Char('d') => self.delete(),
+            KeyCode::Esc => self.exit(),
+            _ => {}
+        }
+    }
+
+    fn exit(&mut self) {
+        self.exit = true;
+    }
+
+    fn delete(&mut self) {
+        self.lyric_widget.state.delete();
+    }
+}
