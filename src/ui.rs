@@ -24,14 +24,14 @@ impl LyricWidget {
     }
 
     fn get_window_title(&self) -> String {
-        match &self.state.current_song {
-            Some(song) => format!(" {} ", song.title),
-            None => " No song playing ".into(),
+        match &self.state.valid {
+            true => self.state.song.title.clone(),
+            false => " No song playing ".into(),
         }
     }
 
     pub fn render_title(&self, area: Rect, buf: &mut Buffer) {
-        if self.state.current_song.is_none() {
+        if !self.state.valid {
             return;
         }
         // 渲染标题区块
@@ -40,7 +40,7 @@ impl LyricWidget {
             .style(Style::default().fg(Color::LightBlue));
 
         // 显示歌曲信息
-        let song = &self.state.current_song.clone().unwrap();
+        let song = &self.state.song.clone();
 
         let line_title = song.title.clone();
         let line_artist = song.artist.clone();
@@ -56,11 +56,11 @@ impl LyricWidget {
 
     /// 进度
     pub fn render_gauge(&self, area: Rect, buf: &mut Buffer) {
-        if self.state.current_song.is_none() {
+        if !self.state.valid {
             return;
         }
 
-        let song = &self.state.current_song.clone().unwrap();
+        let song = &self.state.song.clone();
 
         let label = Span::styled(
             format!(
@@ -80,10 +80,7 @@ impl LyricWidget {
             .render(area, buf);
     }
 
-    // 搜索
-    // pub fn search_render(&self, area: Rect, buf: &mut Buffer) {}
-
-    pub fn lyric_render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render_lyric(&self, area: Rect, buf: &mut Buffer) {
         let state = &self.state;
 
         // 渲染错误信息

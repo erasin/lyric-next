@@ -11,25 +11,41 @@ use crate::{
 // 新增显示参数结构体
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ViewMetrics {
-    pub visible_lines: usize,   // 可见行数
-    pub content_height: usize,  // 总内容高度
-    pub scroll_range: usize,    // 最大可滚动范围
-    pub viewport_height: usize, // 视口高度
-    pub line_height: u16,       // 单行高度
+    /// 可见行数
+    pub visible_lines: usize,
+    /// 总内容高度
+    pub content_height: usize,
+    /// 最大可滚动范围
+    pub scroll_range: usize,
+    /// 视口高度
+    pub viewport_height: usize,
+    /// 单行高度
+    pub line_height: u16,
 }
 
 // 界面状态管理
 #[derive(Clone, Default)]
 pub struct AppState {
-    pub current_song: Option<SongInfo>,
+    /// 是否通过
+    pub valid: bool,
+    // 当前歌曲
+    pub song: SongInfo,
+    /// 播放时间
     pub play_time: PlayTime,
+    /// 当前歌词
     pub lyrics: Vec<LyricLine>,
-    pub target_scroll: usize,          // 目标滚动位置
-    pub current_scroll: f64,           // 当前实际滚动位置
-    pub view_metrics: ViewMetrics,     // 新增显示参数
-    pub error_message: Option<String>, // 新增错误状态
-    pub retry_counter: u32,            // 重试计数器
-    pub progress: u16,                 // 进度
+    /// 目标滚动位置
+    pub target_scroll: usize,
+    /// 当前实际滚动位置
+    pub current_scroll: f64,
+    /// 新增显示参数
+    pub view_metrics: ViewMetrics,
+    /// 新增错误状态
+    pub error_message: Option<String>,
+    /// 重试计数器
+    pub retry_counter: u32,
+    /// 进度
+    pub progress: u16,
 }
 
 impl AppState {
@@ -49,6 +65,12 @@ impl AppState {
         };
     }
 
+    fn reset(&mut self) {
+        if self.valid {
+            *self = AppState::default();
+        }
+    }
+
     pub async fn update(&mut self) {
         self.error_message = None; // 清除旧错误        
 
@@ -65,22 +87,23 @@ impl AppState {
         let song = match get_current_song() {
             Ok(s) => s,
             Err(LyricError::NoPlayerFound) => {
-                // self.player = None.into();
-                self.current_song = None;
-                self.lyrics.clear();
+                self.reset();
                 return Ok(());
             }
             Err(e) => return Err(e),
         };
 
         // 歌曲发生变化时重新加载歌词
-        if Some(song.clone()) != self.current_song {
-            self.handle_song_change(&song).await?;
+        if song != self.song {
+            self.reset();
+            self.valid = true;
+            self.song = song.clone();
+            let doc = get_lyric_client().get_lyric(&song).await?;
+            self.lyrics = LyricParser::parse(&doc, song.duration)?;
         }
 
         // 获取当前播放进度
         self.play_time = get_current_time_song(self.play_time.clone())?;
-
         self.progress = (self.play_time.current_time * 100.0 / song.duration) as u16;
 
         // 更新滚动位置
@@ -96,20 +119,7 @@ impl AppState {
         Ok(())
     }
 
-    async fn handle_song_change(&mut self, song: &SongInfo) -> Result<(), LyricError> {
-        self.current_song = Some(song.clone());
-        self.lyrics.clear();
-        self.target_scroll = 0;
-        self.current_scroll = 0.0;
-
-        if let Some(song) = &self.current_song {
-            let doc = get_lyric_client().get_lyric(song).await?;
-            self.lyrics = LyricParser::parse(&doc, song.duration)?;
-        }
-
-        Ok(())
-    }
-
+    /// 当前播放的 line
     pub fn find_current_line(&self) -> Option<usize> {
         self.lyrics
             .iter()
@@ -138,8 +148,8 @@ impl AppState {
     }
 
     pub fn delete(&self) {
-        if let Some(song) = &self.current_song {
-            get_lyric_client().cache.delete(song);
+        if self.valid {
+            get_lyric_client().cache.delete(&self.song);
         }
     }
 }

@@ -6,10 +6,13 @@ use ropey::Rope;
 use crate::{error::LyricError, utils::normalize_text};
 
 /// 歌曲信息
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct SongInfo {
+    /// 标题
     pub title: String,
+    /// 作者
     pub artist: String,
+    /// 时长
     pub duration: f64,
 }
 
@@ -21,6 +24,7 @@ impl SongInfo {
             title: normalize_text(&self.title),
             artist: normalize_text(&self.artist),
             duration: 0.,
+            ..self.clone()
         }
     }
 }
@@ -32,6 +36,7 @@ fn is_valid_player(player: &Player) -> bool {
     !blacklist_keywords.iter().any(|k| identity.contains(k))
 }
 
+/// 获取 当前播放的 mpris player
 fn get_player() -> Result<Player, LyricError> {
     let player_finder = PlayerFinder::new()?;
     let player = player_finder
@@ -44,7 +49,7 @@ fn get_player() -> Result<Player, LyricError> {
     Ok(player)
 }
 
-/// 获取当前播放
+/// 获取当前播放歌曲
 pub fn get_current_song() -> Result<SongInfo, LyricError> {
     let player = get_player()?;
     let metadata = player.get_metadata()?;

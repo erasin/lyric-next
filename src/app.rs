@@ -44,20 +44,20 @@ impl App {
             Direction::Vertical,
             [
                 Constraint::Length(4), // 标题栏目
-                Constraint::Length(1), // 进度
                 Constraint::Min(1),    // 歌词区域
+                Constraint::Length(1), // 进度
             ],
         );
 
-        let [header_chunk, gauge_chunk, lyric_chunk] = chunks.areas(frame.area());
+        let [header_chunk, lyric_chunk, gauge_chunk] = chunks.areas(frame.area());
 
         let size = lyric_chunk.as_size();
         self.lyric_widget.update_size(size);
 
         let buf = frame.buffer_mut();
         self.lyric_widget.render_title(header_chunk, buf);
+        self.lyric_widget.render_lyric(lyric_chunk, buf);
         self.lyric_widget.render_gauge(gauge_chunk, buf);
-        self.lyric_widget.lyric_render(lyric_chunk, buf);
     }
 
     fn handle_event(&mut self, event: &Event) {
