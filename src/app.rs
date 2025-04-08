@@ -55,8 +55,8 @@ impl App {
         self.lyric_widget.update_size(size);
 
         let buf = frame.buffer_mut();
-        self.lyric_widget.title_render(header_chunk, buf);
-        self.lyric_widget.gauge_render(gauge_chunk, buf);
+        self.lyric_widget.render_title(header_chunk, buf);
+        self.lyric_widget.render_gauge(gauge_chunk, buf);
         self.lyric_widget.lyric_render(lyric_chunk, buf);
     }
 

@@ -44,7 +44,7 @@ impl AppState {
             visible_lines,
             content_height,
             scroll_range,
-            viewport_height: viewport_height as usize,
+            viewport_height,
             line_height: 1, // 假设单行高度为1
         };
     }
@@ -81,8 +81,7 @@ impl AppState {
         // 获取当前播放进度
         self.play_time = get_current_time_song(self.play_time.clone())?;
 
-        self.progress = (self.play_time.current_time * 100.0 / &song.duration) as u16;
-        log::debug!("{:?} {:?} {}", self.play_time, song, self.progress);
+        self.progress = (self.play_time.current_time * 100.0 / song.duration) as u16;
 
         // 更新滚动位置
         if let Some(pos) = self.find_current_line() {

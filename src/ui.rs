@@ -3,7 +3,7 @@ use ratatui::{
     layout::{Rect, Size},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Gauge, Paragraph, Widget, Wrap},
 };
 
 use crate::state::AppState;
@@ -30,7 +30,7 @@ impl LyricWidget {
         }
     }
 
-    pub fn title_render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render_title(&self, area: Rect, buf: &mut Buffer) {
         if self.state.current_song.is_none() {
             return;
         }
@@ -42,10 +42,8 @@ impl LyricWidget {
         // 显示歌曲信息
         let song = &self.state.current_song.clone().unwrap();
 
-        let line_title = format!("{}", song.title);
-        let line_artist = format!("{}", song.artist);
-
-        // buf.set_string(Style::default().fg(Color::LightBlue));
+        let line_title = song.title.clone();
+        let line_artist = song.artist.clone();
 
         let lines = vec![Line::raw(line_title), Line::raw(line_artist)];
 
@@ -57,7 +55,7 @@ impl LyricWidget {
     }
 
     /// 进度
-    pub fn gauge_render(&self, area: Rect, buf: &mut Buffer) {
+    pub fn render_gauge(&self, area: Rect, buf: &mut Buffer) {
         if self.state.current_song.is_none() {
             return;
         }

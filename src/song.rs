@@ -5,6 +5,7 @@ use ropey::Rope;
 
 use crate::{error::LyricError, utils::normalize_text};
 
+/// 歌曲信息
 #[derive(Debug, Clone, PartialEq)]
 pub struct SongInfo {
     pub title: String,
@@ -13,6 +14,7 @@ pub struct SongInfo {
 }
 
 impl SongInfo {
+    /// 歌曲信息的标准化
     #[allow(dead_code)]
     fn normalized(&self) -> Self {
         Self {
@@ -23,22 +25,28 @@ impl SongInfo {
     }
 }
 
-// 优化播放器查找逻辑
+/// 优化播放器查找逻辑
 fn is_valid_player(player: &Player) -> bool {
     let identity = player.identity().to_lowercase();
     let blacklist_keywords = ["browser", "video", "screen-cast", "chromium", "firefox"];
     !blacklist_keywords.iter().any(|k| identity.contains(k))
 }
 
-pub fn get_current_song() -> Result<SongInfo, LyricError> {
+fn get_player() -> Result<Player, LyricError> {
     let player_finder = PlayerFinder::new()?;
     let player = player_finder
         .find_all()?
         .into_iter()
-        .filter(|player| is_valid_player(&player))
+        .filter(is_valid_player)
         .max_by_key(|p| p.is_running()) // 优先选择正在播放的
         .ok_or_else(|| LyricError::NoPlayerFound)?;
 
+    Ok(player)
+}
+
+/// 获取当前播放
+pub fn get_current_song() -> Result<SongInfo, LyricError> {
+    let player = get_player()?;
     let metadata = player.get_metadata()?;
 
     // 获取所有活动播放器并过滤
@@ -64,9 +72,7 @@ pub struct PlayTime {
 
 /// 获取当前歌曲的播放时间
 pub fn get_current_time_song(st: PlayTime) -> Result<PlayTime, LyricError> {
-    let player = PlayerFinder::new()?
-        .find_active()
-        .map_err(|_| LyricError::NoPlayerFound)?;
+    let player = get_player()?;
     let mut st = st;
 
     match player.get_position().map(|d| d.as_secs_f64()) {
@@ -96,11 +102,11 @@ impl LyricParser {
         // 第一阶段：收集所有时间标签和文本
         for line in doc.lines() {
             let line_str = line.to_string();
-            let (time_tags, text) = Self::parse_line(&line_str)?;
-
-            for ts in time_tags {
-                entries.push((ts, text.clone()));
-            }
+            if let Ok((time_tags, text)) = Self::parse_line(&line_str) {
+                for ts in time_tags {
+                    entries.push((ts, text.clone()));
+                }
+            };
         }
 
         // 按时间排序
@@ -139,11 +145,12 @@ impl LyricParser {
             };
 
             let time_str = &line[1..end_idx];
+            // 余下为内容
             line = &line[end_idx + 1..];
 
             match Self::parse_time(time_str) {
                 Some(time) => time_tags.push(time),
-                None => return Err(LyricError::InvalidTimeFormat(time_str.to_string())),
+                None => return Err(LyricError::InvalidTimeFormat),
             }
         }
 

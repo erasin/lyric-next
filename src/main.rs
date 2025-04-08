@@ -26,6 +26,12 @@ pub fn init_logger() -> Result<()> {
 
     let log_file = log_dir.join("lyric.log");
 
+    #[cfg(debug_assertions)]
+    let level = log::LevelFilter::Trace;
+
+    #[cfg(not(debug_assertions))]
+    let level = log::LevelFilter::Info;
+
     // 配置日志输出到文件和终端
     env_logger::Builder::new()
         .format(|buf, record| {
@@ -38,7 +44,7 @@ pub fn init_logger() -> Result<()> {
                 record.args()
             )
         })
-        .filter(None, log::LevelFilter::Trace) // 默认日志级别
+        .filter(None, level) // 默认日志级别
         .target(env_logger::Target::Pipe(Box::new(
             OpenOptions::new()
                 .create(true)

@@ -35,8 +35,8 @@ pub enum LyricError {
     #[error("Lyric decode failed")]
     LyricDecodeError,
 
-    #[error("Invalid time format: {0}")]
-    InvalidTimeFormat(String),
+    #[error("Invalid time format")]
+    InvalidTimeFormat,
 
     #[error("Empty lyric content")]
     EmptyLyric,
