@@ -1,6 +1,9 @@
-use std::time::Instant;
+use std::{
+    ops::Add,
+    time::{Duration, Instant},
+};
 
-use mpris::{Player, PlayerFinder};
+use mpris::{Player, PlayerFinder, TrackID};
 use ropey::Rope;
 
 use crate::{error::LyricError, utils::normalize_text};
@@ -8,6 +11,7 @@ use crate::{error::LyricError, utils::normalize_text};
 /// 歌曲信息
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct SongInfo {
+    pub track_id: String,
     /// 标题
     pub title: String,
     /// 作者
@@ -54,12 +58,15 @@ pub fn get_current_song() -> Result<SongInfo, LyricError> {
     let player = get_player()?;
     let metadata = player.get_metadata()?;
 
+    let track_id = metadata.track_id().unwrap().to_string();
+
     // 获取所有活动播放器并过滤
     let title = metadata.title().unwrap_or_default().to_string();
     let artist = metadata.artists().map(|a| a.join(", ")).unwrap_or_default();
     let duration = metadata.length().map(|d| d.as_secs_f64()).unwrap_or(0.0);
 
     Ok(SongInfo {
+        track_id,
         title,
         artist,
         duration,
@@ -95,6 +102,40 @@ pub fn get_current_time_song(st: PlayTime) -> Result<PlayTime, LyricError> {
     }
 
     Ok(st)
+}
+
+#[derive(Clone, PartialEq, Eq, Default)]
+pub enum PlayerAction {
+    #[default]
+    Toggle,
+    Left,
+    Right,
+    Next,
+    Previous,
+}
+
+pub fn player_action(action: PlayerAction, song: &SongInfo) -> Result<(), LyricError> {
+    let player = get_player()?;
+
+    match action {
+        PlayerAction::Toggle => player.play_pause()?,
+        PlayerAction::Left => {
+            let track_id = TrackID::new(song.track_id.clone()).unwrap_or(TrackID::no_track());
+            let add = Duration::from_secs(5);
+            let pos = player.get_position()? - add;
+            player.set_position(track_id, &pos)?;
+        }
+        PlayerAction::Right => {
+            let track_id = TrackID::new(song.track_id.clone()).unwrap_or(TrackID::no_track());
+            let add = Duration::from_secs(5);
+            let pos = player.get_position()? + add;
+            player.set_position(track_id, &pos)?;
+        }
+        PlayerAction::Next => player.next()?,
+        PlayerAction::Previous => player.previous()?,
+    }
+
+    Ok(())
 }
 
 // 解析主逻辑

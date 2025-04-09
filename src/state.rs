@@ -5,7 +5,10 @@ use ratatui::layout::Size;
 use crate::{
     client::get_lyric_client,
     error::LyricError,
-    song::{LyricLine, LyricParser, PlayTime, SongInfo, get_current_song, get_current_time_song},
+    song::{
+        LyricLine, LyricParser, PlayTime, PlayerAction, SongInfo, get_current_song,
+        get_current_time_song, player_action,
+    },
 };
 
 // 新增显示参数结构体
@@ -150,6 +153,12 @@ impl AppState {
     pub fn delete(&self) {
         if self.valid {
             get_lyric_client().cache.delete(&self.song);
+        }
+    }
+
+    pub fn action(&self, action: PlayerAction) {
+        if let Err(e) = player_action(action, &self.song) {
+            log::error!("Action: {e}");
         }
     }
 }
