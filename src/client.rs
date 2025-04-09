@@ -79,7 +79,7 @@ impl LyricClient {
                 Box::new(NeteaseFetcher::default()),
                 Box::new(QQMusicFetcher::default()),
                 Box::new(KugouFetcher::default()),
-                // Box::new(OvhFetcher::default()),
+                Box::new(OvhFetcher::default()),
             ],
             cache: CacheManager::new(),
         }

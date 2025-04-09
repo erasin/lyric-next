@@ -6,11 +6,10 @@ use crossterm::event::{Event, EventStream, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     DefaultTerminal, Frame,
     buffer::Buffer,
-    layout::{Constraint, Direction, Layout},
-    layout::{Rect, Size},
+    layout::{Alignment, Constraint, Direction, Layout, Rect, Size},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Gauge, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, Paragraph, Widget, Wrap},
 };
 use tokio_stream::StreamExt;
 
@@ -18,6 +17,7 @@ use tokio_stream::StreamExt;
 
 pub struct App {
     exit: bool,
+    help: bool,
 
     pub state: AppState,
 }
@@ -44,6 +44,9 @@ impl App {
     }
 
     fn draw(&mut self, frame: &mut Frame) {
+        let area = frame.area();
+        let buf = frame.buffer_mut();
+
         // 创建垂直布局
         let chunks = Layout::new(
             Direction::Vertical,
@@ -54,15 +57,19 @@ impl App {
             ],
         );
 
-        let [header_chunk, lyric_chunk, gauge_chunk] = chunks.areas(frame.area());
+        let [header_chunk, lyric_chunk, gauge_chunk] = chunks.areas(area);
 
         let size = lyric_chunk.as_size();
         self.update_size(size);
 
-        let buf = frame.buffer_mut();
         self.render_title(header_chunk, buf);
         self.render_lyric(lyric_chunk, buf);
         self.render_gauge(gauge_chunk, buf);
+
+        if self.help {
+            Clear.render(area, buf);
+            self.render_helper(area, buf);
+        }
     }
 
     fn handle_event(&mut self, event: &Event) {
@@ -74,7 +81,16 @@ impl App {
     }
 
     fn handle_key_event(&mut self, key_event: &KeyEvent) {
+        if self.help {
+            match key_event.code {
+                KeyCode::Char('q') | KeyCode::Esc => self.help = false,
+                _ => {}
+            }
+            return;
+        }
+
         match key_event.code {
+            KeyCode::Char('h') | KeyCode::Char('?') => self.help = !self.help,
             KeyCode::Char('q') | KeyCode::Esc => self.exit(),
             KeyCode::Char('d') | KeyCode::Delete => self.delete(),
             KeyCode::Left => self.state.action(PlayerAction::Left),
@@ -171,7 +187,12 @@ impl App {
         if let Some(err_msg) = &state.error_message {
             let error_block = Paragraph::new(err_msg.clone())
                 .style(Style::default().fg(Color::Red))
-                .block(Block::default().borders(Borders::ALL));
+                .block(
+                    Block::default()
+                        .title("ERROR")
+                        .title_alignment(Alignment::Center)
+                        .borders(Borders::ALL),
+                );
             error_block.render(area, buf);
             return;
         }
@@ -219,7 +240,26 @@ impl App {
         Paragraph::new(lines)
             .block(block)
             .wrap(Wrap { trim: true })
-            .centered()
+            .render(area, buf);
+    }
+
+    // 帮助
+    pub fn render_helper(&self, area: Rect, buf: &mut Buffer) {
+        let block = Block::default().title("HELP").borders(Borders::ALL);
+
+        let lines = vec![
+            Line::raw("h | ?   : 帮助."),
+            Line::raw("q | ESC : 退出."),
+            Line::raw("d | Delete  : 删除当前歌词"),
+            Line::raw("Left : 快退"),
+            Line::raw("Right: 快进"),
+            Line::raw("n : 下一曲"),
+            Line::raw("p : 上一曲"),
+        ];
+
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: true })
             .render(area, buf);
     }
 }

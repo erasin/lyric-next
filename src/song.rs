@@ -1,7 +1,4 @@
-use std::{
-    ops::Add,
-    time::{Duration, Instant},
-};
+use std::time::{Duration, Instant};
 
 use mpris::{Player, PlayerFinder, TrackID};
 use ropey::Rope;
