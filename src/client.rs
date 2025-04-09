@@ -92,7 +92,7 @@ impl LyricClient {
         }
 
         for fetcher in &self.fetchers {
-            log::debug!("Trying source: {}", fetcher.source_name());
+            log::info!("Trying source: {}", fetcher.source_name());
             match fetcher.fetch_lyric(song).await {
                 Ok(lyric) => {
                     //if self.validate_lyric(song, &lyric) {

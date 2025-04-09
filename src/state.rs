@@ -48,7 +48,7 @@ pub struct AppState {
     /// 重试计数器
     pub retry_counter: u32,
     /// 进度
-    pub progress: u16,
+    pub progress: f64,
 }
 
 impl AppState {
@@ -107,7 +107,7 @@ impl AppState {
 
         // 获取当前播放进度
         self.play_time = get_current_time_song(self.play_time.clone())?;
-        self.progress = (self.play_time.current_time * 100.0 / song.duration) as u16;
+        self.progress = self.play_time.current_time / song.duration;
 
         // 更新滚动位置
         if let Some(pos) = self.find_current_line() {

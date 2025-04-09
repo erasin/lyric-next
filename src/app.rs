@@ -174,7 +174,7 @@ impl App {
 
         Gauge::default()
             .gauge_style(Style::new().blue().on_dark_gray())
-            .percent(self.state.progress)
+            .percent((self.state.progress * 100.0) as u16)
             .label(label)
             .render(area, buf);
     }
