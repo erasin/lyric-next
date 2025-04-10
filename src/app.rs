@@ -236,7 +236,8 @@ impl LyricScreen {
 
         let block = Block::default()
             .title(self.get_window_title())
-            .borders(Borders::ALL);
+            .borders(Borders::ALL)
+            .padding(Padding::horizontal(1));
 
         Paragraph::new(lines)
             .block(block)
@@ -250,8 +251,8 @@ impl LyricScreen {
             KeyCode::Left => self.state.action(PlayerAction::Left),
             KeyCode::Right => self.state.action(PlayerAction::Right),
             KeyCode::Char(' ') => self.state.action(PlayerAction::Toggle),
-            KeyCode::Char('n') => self.state.action(PlayerAction::Next),
-            KeyCode::Char('p') => self.state.action(PlayerAction::Previous),
+            KeyCode::Char('n') | KeyCode::Char('j') => self.state.action(PlayerAction::Next),
+            KeyCode::Char('p') | KeyCode::Char('k') => self.state.action(PlayerAction::Previous),
             _ => {}
         }
     }
@@ -430,8 +431,8 @@ impl HelpScreen {
             ("d | Delete ", " 删除当前歌词"),
             ("      Left ", " 快退"),
             ("     Right ", "快进"),
-            ("         n ", "下一曲"),
-            ("         p ", "上一曲"),
+            ("     n | j ", "下一曲"),
+            ("     p | k ", "上一曲"),
         ];
         help(lines).render(lyric_chunk, buf);
 
