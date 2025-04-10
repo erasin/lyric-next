@@ -1,14 +1,15 @@
-use anyhow::Result;
-use chrono::Local;
-use clap::Parser;
-use lyric_next::cache::CACHE_DIR;
-// use color_eyre::Result;
-use lyric_next::{app::App, client::get_lyric_client};
 use std::io::Write;
 use std::{
     fs::{self, OpenOptions},
     path::PathBuf,
 };
+
+use anyhow::Result;
+use chrono::Local;
+use clap::Parser;
+use lyric_next::cache::CACHE_DIR;
+use lyric_next::client::get_lyric_client;
+use lyric_next::ui::App;
 
 #[derive(Parser, Debug)]
 #[clap(version, about)]
