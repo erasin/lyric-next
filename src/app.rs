@@ -199,8 +199,7 @@ impl App {
 
         // 使用预计算的显示参数
         let metrics = &state.view_metrics;
-        let scroll_pos = state.current_scroll as usize;
-        let start = scroll_pos.min(metrics.scroll_range);
+        let start = state.target_scroll.min(metrics.scroll_range);
         let end = (start + metrics.visible_lines).min(metrics.content_height);
         let mut lines = Vec::new();
         for (i, line) in state.lyrics[start..end].iter().enumerate() {

@@ -39,8 +39,6 @@ pub struct AppState {
     pub lyrics: Vec<LyricLine>,
     /// 目标滚动位置
     pub target_scroll: usize,
-    /// 当前实际滚动位置
-    pub current_scroll: f64,
     /// 新增显示参数
     pub view_metrics: ViewMetrics,
     /// 新增错误状态
@@ -114,10 +112,6 @@ impl AppState {
             let target_offset = pos.saturating_sub(self.view_metrics.visible_lines / 2);
             self.target_scroll = target_offset.min(self.view_metrics.scroll_range);
         }
-
-        // 平滑滚动插值（每秒移动20像素）
-        let scroll_delta = (self.target_scroll as f64 - self.current_scroll) * 0.2;
-        self.current_scroll += scroll_delta;
 
         Ok(())
     }

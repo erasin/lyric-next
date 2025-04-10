@@ -135,11 +135,18 @@ pub fn player_action(action: PlayerAction, song: &SongInfo) -> Result<(), LyricE
     Ok(())
 }
 
+#[derive(Debug, Clone)]
+pub struct LyricLine {
+    pub timestamp_start: f64, // 单位：秒
+    pub timestamp_end: f64,   // 单位：秒
+    pub text: String,
+}
+
 // 解析主逻辑
 pub struct LyricParser;
 
 impl LyricParser {
-    pub fn parse(doc: &Rope, duration: f64) -> Result<Vec<LyricLine>, LyricError> {
+    pub fn parse(doc: &Rope, song_duration: f64) -> Result<Vec<LyricLine>, LyricError> {
         let mut entries = Vec::new();
 
         // 第一阶段：收集所有时间标签和文本
@@ -161,7 +168,7 @@ impl LyricParser {
             let end = entries
                 .get(i + 1)
                 .map(|(next_start, _)| *next_start)
-                .unwrap_or(duration);
+                .unwrap_or(song_duration);
 
             lyrics.push(LyricLine {
                 timestamp_start: start,
@@ -218,11 +225,4 @@ impl LyricParser {
 
         Some(minutes * 60.0 + seconds + millis / 100.0)
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct LyricLine {
-    pub timestamp_start: f64, // 单位：秒
-    pub timestamp_end: f64,   // 单位：秒
-    pub text: String,
 }
