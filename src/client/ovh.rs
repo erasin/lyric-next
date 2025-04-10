@@ -6,6 +6,7 @@ use crate::{error::LyricError, song::SongInfo};
 use super::{BaseFetcher, LyricFetcher};
 
 // Spotify音乐实现
+#[allow(dead_code)]
 #[derive(Default)]
 pub(super) struct OvhFetcher {
     base: BaseFetcher,

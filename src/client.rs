@@ -3,7 +3,6 @@ use std::sync::OnceLock;
 use async_trait::async_trait;
 use kugou::KugouFetcher;
 use netease::NeteaseFetcher;
-use ovh::OvhFetcher;
 use qqmusic::QQMusicFetcher;
 use reqwest::RequestBuilder;
 use ropey::Rope;
@@ -79,7 +78,7 @@ impl LyricClient {
                 Box::new(NeteaseFetcher::default()),
                 Box::new(QQMusicFetcher::default()),
                 Box::new(KugouFetcher::default()),
-                Box::new(OvhFetcher::default()),
+                // Box::new(OvhFetcher::default()),
             ],
             cache: CacheManager::new(),
         }

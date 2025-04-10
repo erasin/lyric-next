@@ -28,9 +28,7 @@ pub struct ViewMetrics {
 
 // 界面状态管理
 #[derive(Clone, Default)]
-pub struct AppState {
-    /// 是否通过
-    pub valid: bool,
+pub struct LyricState {
     // 当前歌曲
     pub song: SongInfo,
     /// 播放时间
@@ -49,7 +47,7 @@ pub struct AppState {
     pub progress: f64,
 }
 
-impl AppState {
+impl LyricState {
     // 预计算显示参数
     pub fn calculate_metrics(&mut self, area: Size) {
         let content_height = self.lyrics.len();
@@ -67,9 +65,7 @@ impl AppState {
     }
 
     fn reset(&mut self) {
-        if self.valid {
-            *self = AppState::default();
-        }
+        *self = LyricState::default();
     }
 
     pub async fn update(&mut self) {
@@ -97,7 +93,6 @@ impl AppState {
         // 歌曲发生变化时重新加载歌词
         if song != self.song {
             self.reset();
-            self.valid = true;
             self.song = song.clone();
             let doc = get_lyric_client().get_lyric(&song).await?;
             self.lyrics = LyricParser::parse(&doc, song.duration)?;
@@ -145,7 +140,7 @@ impl AppState {
     }
 
     pub fn delete(&self) {
-        if self.valid {
+        if !self.song.title.is_empty() {
             get_lyric_client().cache.delete(&self.song);
         }
     }
